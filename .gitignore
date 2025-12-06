@@ -1,0 +1,37 @@
+# ===== 编译产物 =====
+*.o
+*.obj
+*.a
+*.so
+*.dll
+*.exe
+
+# ===== 构建工具缓存与目录 =====
+build/
+out/
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+compile_commands.json
+
+# ===== 日志输出 =====
+*.log
+*.log.*
+
+# ===== 测试/性能输出目录 =====
+output/
+
+# ===== 覆盖率文件 =====
+*.gcno
+*.gcda
+
+# ===== 编辑器/IDE 临时文件 =====
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# 注：*.bak 备份文件按需求保留提交，不忽略

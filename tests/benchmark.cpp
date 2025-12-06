@@ -1,0 +1,391 @@
+﻿/**
+ * @file benchmark.cpp
+ * @brief 异步日志系统性能基准测试
+ * 
+ * 测试场景：
+ * 1. 单线程吞吐量测试
+ * 2. 多线程并发性能测试
+ * 3. 不同日志长度的性能对比
+ * 4. 内存使用测试
+ * 5. 延迟测试（P50/P95/P99）
+ */
+
+#include "logger.h"
+#include <iostream>
+#include <vector>
+#include <thread>
+#include <chrono>
+#include <iomanip>
+#include <algorithm>
+#include <numeric>
+
+using namespace tinymq::common;
+using namespace std::chrono;
+
+// ========== 辅助函数 ==========
+class Timer {
+public:
+    Timer() : start_(steady_clock::now()) {}
+    
+    double elapsedMs() const {
+        auto end = steady_clock::now();
+        return duration_cast<microseconds>(end - start_).count() / 1000.0;
+    }
+    
+    void reset() {
+        start_ = steady_clock::now();
+    }
+
+private:
+    steady_clock::time_point start_;
+};
+
+// ========== 基准测试1：单线程吞吐量 ==========
+void benchmark_single_thread() {
+    std::cout << "\n========== Benchmark 1: Single Thread Throughput ==========\n";
+    
+    AsyncLogger::getInstance().setLogLevel(LogLevel::INFO);
+    AsyncLogger::getInstance().setOutputFile("bench_single.log", 500 * 1024 * 1024);
+    AsyncLogger::getInstance().start();
+    
+    const int numLogs = 100000;
+    
+    Timer timer;
+    for (int i = 0; i < numLogs; ++i) {
+        LOG_INFO << "Single thread benchmark message #" << i << " with some data";
+    }
+    double writeTime = timer.elapsedMs();
+    
+    // 等待所有日志写入完成
+    std::this_thread::sleep_for(std::chrono::seconds(2));
+    
+    auto stats = AsyncLogger::getInstance().getStats();
+    
+    std::cout << std::fixed << std::setprecision(2);
+    std::cout << "Results:\n";
+    std::cout << "  Total logs: " << stats.totalLogs << "\n";
+    std::cout << "  Write time: " << writeTime << " ms\n";
+    std::cout << "  Throughput: " << (numLogs * 1000.0 / writeTime) << " logs/sec\n";
+    std::cout << "  Avg latency: " << (writeTime * 1000.0 / numLogs) << " μs/log\n";
+    std::cout << "  Bytes written: " << (stats.bytesWritten / 1024.0 / 1024.0) << " MB\n";
+    
+    AsyncLogger::getInstance().stop();
+}
+
+// ========== 基准测试2：多线程并发 ==========
+void benchmark_worker(int threadId, int numLogs, std::vector<double>& latencies) {
+    latencies.reserve(numLogs);
+    
+    for (int i = 0; i < numLogs; ++i) {
+        auto start = steady_clock::now();
+        
+        LOG_INFO << "Thread-" << threadId 
+                 << " message #" << i 
+                 << " data: " << (i * 3.14159);
+        
+        auto end = steady_clock::now();
+        double latency = duration_cast<nanoseconds>(end - start).count() / 1000.0; // μs
+        latencies.push_back(latency);
+    }
+}
+
+void benchmark_multi_thread() {
+    std::cout << "\n========== Benchmark 2: Multi-threaded Performance ==========\n";
+    
+    AsyncLogger::getInstance().setLogLevel(LogLevel::INFO);
+    AsyncLogger::getInstance().setOutputFile("bench_multi.log", 500 * 1024 * 1024);
+    AsyncLogger::getInstance().start();
+    
+    const int numThreads = 10;
+    const int logsPerThread = 50000;
+    const uint64_t thisRunLogs = static_cast<uint64_t>(numThreads) * logsPerThread;
+
+    std::vector<std::thread> threads;
+    std::vector<std::vector<double>> allLatencies(numThreads);
+
+    auto beforeStats = AsyncLogger::getInstance().getStats();
+
+    Timer timer;
+    for (int i = 0; i < numThreads; ++i) {
+        threads.emplace_back(benchmark_worker, i, logsPerThread, std::ref(allLatencies[i]));
+    }
+    
+    for (auto& t : threads) {
+        t.join();
+    }
+    double totalTime = timer.elapsedMs();
+    
+    // 等待写入完成
+    std::this_thread::sleep_for(std::chrono::seconds(3));
+    
+    auto stats = AsyncLogger::getInstance().getStats();
+    // 字节数取本组增量，避免与上一组基准的累计写入混淆
+    uint64_t bytesDelta = stats.bytesWritten - beforeStats.bytesWritten;
+    
+    // 合并所有延迟数据
+    std::vector<double> latencies;
+    for (const auto& threadLatencies : allLatencies) {
+        latencies.insert(latencies.end(), threadLatencies.begin(), threadLatencies.end());
+    }
+    std::sort(latencies.begin(), latencies.end());
+    
+    // 计算延迟百分位
+    auto percentile = [&](double p) {
+        size_t idx = static_cast<size_t>(latencies.size() * p);
+        return latencies[idx];
+    };
+    
+    double avgLatency = std::accumulate(latencies.begin(), latencies.end(), 0.0) / latencies.size();
+    
+    std::cout << std::fixed << std::setprecision(2);
+    std::cout << "Results:\n";
+    std::cout << "  Threads: " << numThreads << "\n";
+    std::cout << "  Total logs: " << thisRunLogs << "\n";
+    std::cout << "  Dropped logs: " << stats.droppedLogs << " (" 
+              << (stats.droppedLogs * 100.0 / thisRunLogs) << "%)\n";
+    std::cout << "  Total time: " << totalTime << " ms\n";
+    std::cout << "  Throughput: " << (thisRunLogs * 1000.0 / totalTime) << " logs/sec\n";
+    std::cout << "  Bandwidth: " << (bytesDelta / 1024.0 / 1024.0 / totalTime * 1000) 
+              << " MB/sec\n";
+    std::cout << "\nLatency Distribution:\n";
+    std::cout << "  Average: " << avgLatency << " μs\n";
+    std::cout << "  P50: " << percentile(0.50) << " μs\n";
+    std::cout << "  P90: " << percentile(0.90) << " μs\n";
+    std::cout << "  P95: " << percentile(0.95) << " μs\n";
+    std::cout << "  P99: " << percentile(0.99) << " μs\n";
+    std::cout << "  P999: " << percentile(0.999) << " μs\n";
+    std::cout << "  Max: " << latencies.back() << " μs\n";
+    
+    AsyncLogger::getInstance().stop();
+}
+
+// ========== 基准测试3：不同消息长度 ==========
+void benchmark_varying_lengths() {
+    std::cout << "\n========== Benchmark 3: Varying Message Lengths ==========\n";
+    
+    AsyncLogger::getInstance().setLogLevel(LogLevel::INFO);
+    AsyncLogger::getInstance().setOutputFile("bench_lengths.log", 500 * 1024 * 1024);
+    AsyncLogger::getInstance().start();
+    
+    const int numLogs = 50000;
+    std::vector<int> messageSizes = {10, 50, 100, 200, 500, 1000, 2000};
+    
+    std::cout << std::fixed << std::setprecision(2);
+    std::cout << std::setw(15) << "Message Size" 
+              << std::setw(15) << "Time (ms)" 
+              << std::setw(20) << "Throughput (logs/s)"
+              << std::setw(20) << "Bandwidth (MB/s)" << "\n";
+    std::cout << std::string(70, '-') << "\n";
+    
+    for (int size : messageSizes) {
+        std::string padding(size, 'X');
+        
+        auto beforeStats = AsyncLogger::getInstance().getStats();
+        
+        Timer timer;
+        for (int i = 0; i < numLogs; ++i) {
+            LOG_INFO << "Msg #" << i << " " << padding;
+        }
+        double writeTime = timer.elapsedMs();
+        
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        
+        auto afterStats = AsyncLogger::getInstance().getStats();
+        uint64_t bytesWritten = afterStats.bytesWritten - beforeStats.bytesWritten;
+        
+        double throughput = numLogs * 1000.0 / writeTime;
+        double bandwidth = bytesWritten / 1024.0 / 1024.0 / writeTime * 1000;
+        
+        std::cout << std::setw(15) << size 
+                  << std::setw(15) << writeTime
+                  << std::setw(20) << throughput
+                  << std::setw(20) << bandwidth << "\n";
+    }
+    
+    AsyncLogger::getInstance().stop();
+}
+
+// ========== 基准测试4：极限压力测试 ==========
+void stress_worker(int threadId, int numLogs) {
+    for (int i = 0; i < numLogs; ++i) {
+        LOG_INFO << "T" << threadId << " #" << i << " stress test data XXXXXXXXXX";
+    }
+}
+
+void benchmark_stress_test() {
+    std::cout << "\n========== Benchmark 4: Stress Test (Max Load) ==========\n";
+    
+    AsyncLogger::getInstance().setLogLevel(LogLevel::INFO);
+    AsyncLogger::getInstance().setOutputFile("bench_stress.log", 1024 * 1024 * 1024); // 1GB
+    AsyncLogger::getInstance().start();
+    
+    const int numThreads = 50;
+    const int logsPerThread = 20000;
+    const uint64_t thisRunLogs = static_cast<uint64_t>(numThreads) * logsPerThread;
+    
+    std::cout << "Starting stress test: " << numThreads << " threads × " 
+              << logsPerThread << " logs = " 
+              << thisRunLogs << " total logs...\n";
+    
+    auto beforeStats = AsyncLogger::getInstance().getStats();
+    
+    Timer timer;
+    
+    std::vector<std::thread> threads;
+    for (int i = 0; i < numThreads; ++i) {
+        threads.emplace_back(stress_worker, i, logsPerThread);
+    }
+    
+    for (auto& t : threads) {
+        t.join();
+    }
+    
+    double totalTime = timer.elapsedMs();
+    
+    std::cout << "All threads finished in " << totalTime << " ms, waiting for flush...\n";
+    
+    // 等待后台写入完成
+    std::this_thread::sleep_for(std::chrono::seconds(5));
+    
+    auto stats = AsyncLogger::getInstance().getStats();
+    uint64_t bytesDelta = stats.bytesWritten - beforeStats.bytesWritten;
+    
+    std::cout << std::fixed << std::setprecision(2);
+    std::cout << "\nStress Test Results:\n";
+    std::cout << "  Total logs: " << thisRunLogs << "\n";
+    std::cout << "  Dropped logs: " << stats.droppedLogs 
+              << " (" << (stats.droppedLogs * 100.0 / thisRunLogs) << "%)\n";
+    std::cout << "  Bytes written: " << (bytesDelta / 1024.0 / 1024.0) << " MB\n";
+    std::cout << "  Frontend time: " << totalTime << " ms\n";
+    std::cout << "  Throughput: " << (thisRunLogs * 1000.0 / totalTime) << " logs/sec\n";
+    std::cout << "  Bandwidth: " << (bytesDelta / 1024.0 / 1024.0 / totalTime * 1000) 
+              << " MB/sec\n";
+    
+    AsyncLogger::getInstance().stop();
+}
+
+// ========== 基准测试5：级别过滤性能 ==========
+void benchmark_level_filtering() {
+    std::cout << "\n========== Benchmark 5: Log Level Filtering Performance ==========\n";
+    
+    const int numLogs = 1000000;
+    
+    // Test 1: 所有日志都被记录
+    AsyncLogger::getInstance().setLogLevel(LogLevel::DEBUG);
+    AsyncLogger::getInstance().setOutputFile("bench_filter.log", 500 * 1024 * 1024);
+    AsyncLogger::getInstance().start();
+    
+    Timer timer1;
+    for (int i = 0; i < numLogs; ++i) {
+        LOG_DEBUG << "Debug message #" << i;
+    }
+    double time1 = timer1.elapsedMs();
+    
+    std::this_thread::sleep_for(std::chrono::seconds(2));
+    auto stats1 = AsyncLogger::getInstance().getStats();
+    AsyncLogger::getInstance().stop();
+    
+    // Test 2: 所有日志都被过滤
+    AsyncLogger::getInstance().setLogLevel(LogLevel::ERROR);
+    AsyncLogger::getInstance().setOutputFile("bench_filter2.log", 500 * 1024 * 1024);
+    AsyncLogger::getInstance().start();
+    
+    Timer timer2;
+    for (int i = 0; i < numLogs; ++i) {
+        LOG_DEBUG << "Debug message #" << i;
+    }
+    double time2 = timer2.elapsedMs();
+    
+    std::this_thread::sleep_for(std::chrono::seconds(1));
+    auto stats2 = AsyncLogger::getInstance().getStats();
+    AsyncLogger::getInstance().stop();
+    
+    std::cout << std::fixed << std::setprecision(2);
+    std::cout << "\nResults:\n";
+    std::cout << "  Test 1 (all logged):\n";
+    std::cout << "    Time: " << time1 << " ms\n";
+    std::cout << "    Throughput: " << (numLogs * 1000.0 / time1) << " logs/sec\n";
+    std::cout << "    Logs written: " << stats1.totalLogs << "\n";
+    
+    std::cout << "\n  Test 2 (all filtered):\n";
+    std::cout << "    Time: " << time2 << " ms\n";
+    std::cout << "    Throughput: " << (numLogs * 1000.0 / time2) << " logs/sec\n";
+    std::cout << "    Logs written: " << stats2.totalLogs << "\n";
+    
+    std::cout << "\n  Speedup (filtering): " << (time1 / time2) << "x faster\n";
+}
+
+// ========== 基准测试6：纯前端（不落盘）吞吐 ==========
+// 输出目标为 /dev/null：后台线程照常格式化/加锁/排队，
+// 但写盘立即丢弃，从而隔离磁盘 I/O，测量前端产生日志的真实速率。
+// 用于与落盘版本对比，定位瓶颈在"前端产生"还是"磁盘写入"。
+void benchmark_frontend_only() {
+    std::cout << "\n========== Benchmark 6: Frontend-only Throughput (no disk) ==========\n";
+    
+    AsyncLogger::getInstance().setLogLevel(LogLevel::INFO);
+    AsyncLogger::getInstance().setOutputFile("/dev/null");   // 隔离磁盘
+    AsyncLogger::getInstance().start();
+    
+    const int numLogs = 100000;
+    
+    Timer timer;
+    for (int i = 0; i < numLogs; ++i) {
+        LOG_INFO << "Frontend-only benchmark message #" << i << " with some data";
+    }
+    double writeTime = timer.elapsedMs();
+    
+    std::this_thread::sleep_for(std::chrono::seconds(1));
+    
+    auto stats = AsyncLogger::getInstance().getStats();
+    
+    std::cout << std::fixed << std::setprecision(2);
+    std::cout << "Results (output to /dev/null):\n";
+    std::cout << "  Total logs: " << stats.totalLogs << "\n";
+    std::cout << "  Write time: " << writeTime << " ms\n";
+    std::cout << "  Frontend throughput: " << (numLogs * 1000.0 / writeTime) << " logs/sec\n";
+    std::cout << "  Avg latency: " << (writeTime * 1000.0 / numLogs) << " μs/log\n";
+    
+    AsyncLogger::getInstance().stop();
+}
+
+// ========== 主函数 ==========
+int main(int argc, char* argv[]) {
+    std::cout << "===========================================\n";
+    std::cout << "  Async Logger Performance Benchmarks\n";
+    std::cout << "===========================================\n";
+    
+    if (argc > 1) {
+        int benchNum = std::atoi(argv[1]);
+        switch (benchNum) {
+            case 1: benchmark_single_thread(); break;
+            case 2: benchmark_multi_thread(); break;
+            case 3: benchmark_varying_lengths(); break;
+            case 4: benchmark_stress_test(); break;
+            case 5: benchmark_level_filtering(); break;
+            case 6: benchmark_frontend_only(); break;
+            default:
+                std::cout << "Usage: " << argv[0] << " [1-6]\n";
+                std::cout << "  1: Single thread throughput\n";
+                std::cout << "  2: Multi-threaded performance\n";
+                std::cout << "  3: Varying message lengths\n";
+                std::cout << "  4: Stress test (max load)\n";
+                std::cout << "  5: Log level filtering\n";
+                std::cout << "  6: Frontend-only throughput (no disk)\n";
+                return 1;
+        }
+    } else {
+        // 运行所有基准测试
+        benchmark_single_thread();
+        benchmark_multi_thread();
+        benchmark_varying_lengths();
+        benchmark_stress_test();
+        benchmark_level_filtering();
+        benchmark_frontend_only();
+    }
+    
+    std::cout << "\n===========================================\n";
+    std::cout << "  All benchmarks completed!\n";
+    std::cout << "===========================================\n";
+    
+    return 0;
+}
